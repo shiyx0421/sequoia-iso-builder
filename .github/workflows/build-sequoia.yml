@@ -1,0 +1,100 @@
+name: Build macOS Sequoia ISO (Split for 2GB limit)
+
+on:
+  workflow_dispatch:
+    inputs:
+      format:
+        description: '选择镜像格式'
+        required: true
+        default: 'iso'
+        type: choice
+        options:
+          - iso
+          - dmg
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 80
+
+    steps:
+      - name: 检查磁盘空间
+        run: df -h /
+
+      - name: 下载 Sequoia 安装器（自动获取最新版本）
+        run: |
+          sudo softwareupdate --list-full-installers
+          VERSION=$(sudo softwareupdate --list-full-installers | grep -i "macOS Sequoia" | head -1 | sed -E 's/.*Version: ([0-9.]+),.*/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "⚠️ 未找到 Sequoia，尝试下载版本 15"
+            VERSION="15"
+          fi
+          echo "📥 正在下载 Sequoia $VERSION ..."
+          sudo softwareupdate --fetch-full-installer --full-installer-version "$VERSION"
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+
+      - name: 确认安装器存在
+        run: |
+          if [ ! -d "/Applications/Install macOS Sequoia.app" ]; then
+            echo "❌ 安装器下载失败！"
+            exit 1
+          fi
+          echo "✅ 安装器就绪"
+
+      - name: 构建镜像
+        id: build
+        run: |
+          set -e
+          APP="/Applications/Install macOS Sequoia.app"
+          FORMAT="${{ github.event.inputs.format }}"
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p output
+          cd output
+
+          if [ "$FORMAT" == "iso" ]; then
+            echo "📀 正在生成 ISO ..."
+            hdiutil create -size 16g -volname "Sequoia" -fs HFS+ -type SPARSE -attach sequoia.sparseimage
+            sudo "$APP/Contents/Resources/createinstallmedia" --volume "/Volumes/Sequoia" --nointeraction
+            sleep 5
+            hdiutil detach "/Volumes/Install macOS Sequoia" -force || hdiutil detach "/Volumes/Sequoia" -force
+            hdiutil convert sequoia.sparseimage -format UDTO -o "macOS_Sequoia"
+            mv "macOS_Sequoia.cdr" "macOS_Sequoia.iso"
+          else
+            echo "💾 正在生成 DMG ..."
+            hdiutil create -size 16g -volname "Sequoia" -fs HFS+ -type UDIF -attach sequoia.dmg
+            sudo "$APP/Contents/Resources/createinstallmedia" --volume "/Volumes/Sequoia" --nointeraction
+            sleep 5
+            hdiutil detach "/Volumes/Install macOS Sequoia" -force || hdiutil detach "/Volumes/Sequoia" -force
+            hdiutil resize -size min sequoia.dmg
+            mv sequoia.dmg "macOS_Sequoia.dmg"
+          fi
+
+          echo "file_name=$(ls macOS_Sequoia.*)" >> $GITHUB_OUTPUT
+
+      - name: 拆分大文件（规避 GitHub 2GB 限制）
+        id: split
+        run: |
+          cd output
+          FILE="$(ls macOS_Sequoia.*)"
+          SIZE=$(stat -f%z "$FILE")
+          MAX_SIZE=1900000000  # 1.9GB
+          if [ $SIZE -gt $MAX_SIZE ]; then
+            echo "📦 文件大小约 $(du -h $FILE | cut -f1)，正在拆分为 1.5GB 分卷 ..."
+            split -b 1500m "$FILE" "part_"
+            rm "$FILE"
+            echo "split=true" >> $GITHUB_OUTPUT
+            echo "📋 合并方法：下载所有 part_* 文件到同一文件夹，打开 CMD 执行："
+            echo "   copy /b part_aa + part_ab + part_ac + part_ad + part_ae + part_af + part_ag + part_ah + part_ai + part_aj + part_ak macOS_Sequoia.iso"
+            ls -lh part_* | awk '{print $9, $5}'
+          else
+            echo "split=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 上传构建产物（分卷或原文件）
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sequoia_Installer_${{ github.event.inputs.format }}
+          path: output/
+          retention-days: 7
+          compression-level: 0
